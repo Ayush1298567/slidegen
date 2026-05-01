@@ -49,7 +49,7 @@ function chromeWrapper(chrome: Chrome, theme: Theme): { topRight: string; bottom
   const num = String(chrome.pageNum).padStart(2, '0');
   const total = String(chrome.pageTotal).padStart(2, '0');
   return {
-    topRight: `<div style="position:absolute; top:3.5%; right:4%; font-family:'${theme.fontBody}',sans-serif; font-size:0.85cqw; font-weight:600; letter-spacing:0.25em; text-transform:uppercase; color:${c}; opacity:0.7; z-index:10;">${escapeHtml(chrome.deckTitle.slice(0, 40))}</div>`,
+    topRight: `<div style="position:absolute; top:3.5%; right:4%; max-width:50%; font-family:'${theme.fontBody}',sans-serif; font-size:0.85cqw; font-weight:600; letter-spacing:0.2em; text-transform:uppercase; color:${c}; opacity:0.7; z-index:10; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(chrome.deckTitle)}</div>`,
     bottomRight: `<div style="position:absolute; bottom:3.5%; right:4%; font-family:'${theme.fontBody}',sans-serif; font-size:0.85cqw; font-weight:600; letter-spacing:0.2em; color:${c}; opacity:0.7; z-index:10;">${num} <span style="opacity:0.5;">/ ${total}</span></div>`,
     bottomLeft: `<div style="position:absolute; bottom:3.5%; left:4%; width:3cqw; height:0.15cqw; background:${faint}; opacity:0.4; z-index:10;"></div>`,
   };

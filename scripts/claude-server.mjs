@@ -397,7 +397,20 @@ function validateDeck(deck, expectedCount) {
     if (typeof s.notes !== 'string') return `${where} notes must be a string`;
     if (s.eyebrow != null && typeof s.eyebrow !== 'string') return `${where} eyebrow must be a string if present`;
     if (s.icon != null && typeof s.icon !== 'string') return `${where} icon must be a string if present`;
-    if (!VALID_ASPECTS.includes(s.imageAspect)) return `${where} imageAspect invalid`;
+    // Auto-normalize imageAspect — Claude sometimes returns "9:16", "4:5", or
+    // a value that doesn't match the layout. Snap it to the canonical aspect
+    // for the chosen layout instead of bouncing the whole plan.
+    const layoutDefaults = {
+      'title-hero': '16:9', 'content-image-right': '1:1', 'content-image-left': '1:1',
+      'two-column': 'none', 'big-stat': '1:1', 'full-bleed-quote': '16:9',
+      'section-divider': '16:9', 'comparison': 'none', 'agenda': 'none',
+      'bar-chart': 'none', 'pie-chart': 'none', 'closing-cta': '16:9',
+    };
+    if (layoutDefaults[s.layout]) {
+      s.imageAspect = layoutDefaults[s.layout];
+    } else if (!VALID_ASPECTS.includes(s.imageAspect)) {
+      s.imageAspect = '16:9';
+    }
 
     if (s.layout === 'big-stat') {
       if (!s.stat || typeof s.stat.value !== 'string' || typeof s.stat.label !== 'string') {

@@ -7,7 +7,11 @@
 import { GoogleGenAI, Modality } from '@google/genai';
 import type { ImageAspect, Layout } from './types';
 
-const MODEL = 'gemini-2.5-flash-image';
+// Nano Banana Pro (Gemini 3 Pro Image Preview) when available, with automatic
+// fallback to the stable Flash Image model. Pro produces noticeably stronger
+// composition, lighting, and finish at the cost of slightly higher latency.
+const MODEL_PRIMARY = process.env.SLIDEGEN_GEMINI_MODEL || 'gemini-3-pro-image-preview';
+const MODEL_FALLBACK = 'gemini-2.5-flash-image';
 
 function getClient(): GoogleGenAI {
   const apiKey = process.env.GOOGLE_API_KEY;
@@ -70,19 +74,20 @@ export async function generateSlideImage(input: {
     .filter(Boolean)
     .join('\n\n');
 
-  // Nano Banana occasionally returns finishReason=NO_IMAGE on the first call
-  // for purely structural reasons. Retry up to 3× before giving up.
-  let lastReason = '';
-  for (let attempt = 0; attempt < 3; attempt++) {
+  // Reliability ladder:
+  //   1) Nano Banana Pro (gemini-3-pro-image-preview), 2 attempts
+  //   2) Same prompt, fallback to gemini-2.5-flash-image, 2 attempts
+  //   3) Reword prompt to be more concrete + retry on Flash, 1 attempt
+  // Each attempt is followed by short exponential backoff.
+  const tryModel = async (model: string, prompt: string): Promise<GeneratedImage | { reason: string }> => {
     const response = await ai.models.generateContent({
-      model: MODEL,
-      contents: fullPrompt,
+      model,
+      contents: prompt,
       config: {
         responseModalities: [Modality.IMAGE],
         imageConfig: { aspectRatio: aspectToGemini(input.aspect) },
       },
     });
-
     const candidates = response.candidates ?? [];
     for (const cand of candidates) {
       const parts = cand.content?.parts ?? [];
@@ -98,10 +103,36 @@ export async function generateSlideImage(input: {
         }
       }
     }
-    lastReason = String(candidates[0]?.finishReason ?? 'unknown');
-    // Brief backoff before retry
-    await new Promise((r) => setTimeout(r, 400));
+    return { reason: String(candidates[0]?.finishReason ?? 'unknown') };
+  };
+
+  const attempts: { model: string; prompt: string }[] = [
+    { model: MODEL_PRIMARY, prompt: fullPrompt },
+    { model: MODEL_PRIMARY, prompt: fullPrompt },
+    { model: MODEL_FALLBACK, prompt: fullPrompt },
+    { model: MODEL_FALLBACK, prompt: fullPrompt },
+    // Last-ditch: simpler, more concrete reword
+    { model: MODEL_FALLBACK, prompt: `A clean, high-quality visual: ${input.prompt}. Style: ${input.mood}. ${NO_TEXT_RULE}` },
+  ];
+
+  let lastReason = '';
+  for (let i = 0; i < attempts.length; i++) {
+    try {
+      const result = await tryModel(attempts[i].model, attempts[i].prompt);
+      if ('bytes' in result) return result;
+      lastReason = result.reason;
+    } catch (err) {
+      lastReason = err instanceof Error ? err.message : 'unknown';
+      // If the primary model is unavailable on this account, skip ahead
+      // to the fallback model for the next attempt.
+      const msg = lastReason.toLowerCase();
+      if (msg.includes('not found') || msg.includes('unsupported') || msg.includes('permission')) {
+        // Jump to first fallback attempt
+        while (i + 1 < attempts.length && attempts[i + 1].model === MODEL_PRIMARY) i++;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 350 * (i + 1)));
   }
 
-  throw new Error(`Gemini returned no image data after 3 attempts. finishReason=${lastReason}`);
+  throw new Error(`Gemini returned no image data after ${attempts.length} attempts. Last reason: ${lastReason}`);
 }

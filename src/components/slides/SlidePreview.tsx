@@ -84,10 +84,20 @@ function Chrome({ theme, ctx, light, f }: { theme: Theme; ctx: Ctx; light?: bool
   return (
     <>
       <div
-        className="absolute top-[3.5%] right-[4%] z-10"
-        style={{ fontFamily: f.b, fontSize: '0.85cqw', fontWeight: 600, letterSpacing: '0.25em', textTransform: 'uppercase', color: c, opacity: 0.7 }}
+        className="absolute top-[3.5%] right-[4%] z-10 truncate"
+        style={{
+          maxWidth: '50%',
+          fontFamily: f.b,
+          fontSize: '0.85cqw',
+          fontWeight: 600,
+          letterSpacing: '0.2em',
+          textTransform: 'uppercase',
+          color: c,
+          opacity: 0.7,
+          whiteSpace: 'nowrap',
+        }}
       >
-        {ctx.deckTitle.slice(0, 40)}
+        {ctx.deckTitle}
       </div>
       <div
         className="absolute bottom-[3.5%] right-[4%] z-10"
