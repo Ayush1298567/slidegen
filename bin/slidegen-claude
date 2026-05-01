@@ -1,0 +1,105 @@
+#!/bin/bash
+# slidegen-claude — gstack-style shim that ensures the local Claude server is
+# running, then forwards CLI commands to it.
+#
+# Usage:
+#   bin/slidegen-claude status
+#   bin/slidegen-claude start
+#   bin/slidegen-claude stop
+#   bin/slidegen-claude plan "<topic>" [<slideCount>]
+#
+# State lives in .slidegen/claude-server.json (port + token + pid).
+
+set -e
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STATE_FILE="$ROOT/.slidegen/claude-server.json"
+SERVER_SCRIPT="$ROOT/scripts/claude-server.mjs"
+LOG_FILE="$ROOT/.slidegen/claude-server.log"
+
+read_state_field() {
+  if [ ! -f "$STATE_FILE" ]; then return 1; fi
+  node -e "const s=require('$STATE_FILE');process.stdout.write(String(s.$1??''))" 2>/dev/null
+}
+
+is_alive() {
+  local pid
+  pid="$(read_state_field pid)" || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+start_server() {
+  if is_alive; then
+    echo "already running (pid $(read_state_field pid))"
+    return 0
+  fi
+  mkdir -p "$ROOT/.slidegen"
+  echo "starting claude server…"
+  nohup node "$SERVER_SCRIPT" >"$LOG_FILE" 2>&1 &
+  disown $! 2>/dev/null || true
+  # Wait up to 5s for state file to materialize
+  for _ in $(seq 1 50); do
+    if is_alive; then
+      echo "ready: $(read_state_field port) (pid $(read_state_field pid))"
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "ERROR: server did not start. See $LOG_FILE" >&2
+  return 1
+}
+
+stop_server() {
+  if ! is_alive; then
+    echo "not running"
+    rm -f "$STATE_FILE"
+    return 0
+  fi
+  local pid
+  pid="$(read_state_field pid)"
+  kill "$pid" 2>/dev/null || true
+  rm -f "$STATE_FILE"
+  echo "stopped (pid $pid)"
+}
+
+status() {
+  if is_alive; then
+    echo "running"
+    echo "  pid:   $(read_state_field pid)"
+    echo "  port:  $(read_state_field port)"
+    echo "  since: $(read_state_field startedAt)"
+  else
+    echo "not running"
+    [ -f "$STATE_FILE" ] && echo "  (stale state file at $STATE_FILE)"
+  fi
+}
+
+# Auto-start helper for HTTP calls
+ensure_running() {
+  is_alive || start_server >/dev/null
+}
+
+post() {
+  ensure_running
+  local path="$1" body="$2"
+  local port token
+  port="$(read_state_field port)"
+  token="$(read_state_field token)"
+  curl -sS -X POST "http://127.0.0.1:$port$path" \
+    -H "x-slidegen-token: $token" \
+    -H "content-type: application/json" \
+    -d "$body"
+}
+
+case "${1:-status}" in
+  status)  status ;;
+  start)   start_server ;;
+  stop)    stop_server ;;
+  plan)
+    topic="$2"
+    count="${3:-10}"
+    if [ -z "$topic" ]; then echo "usage: $0 plan <topic> [count]" >&2; exit 1; fi
+    post /plan "{\"topic\":$(node -e "process.stdout.write(JSON.stringify(process.argv[1]))" "$topic"),\"slideCount\":$count}"
+    ;;
+  *) echo "unknown command: $1" >&2; exit 1 ;;
+esac
