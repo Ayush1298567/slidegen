@@ -210,6 +210,14 @@ export default function Home() {
   } | null>(null);
   const [deckReviewing, setDeckReviewing] = useState(false);
   const [savedDecks, setSavedDecks] = useState<{ id: string; title: string; updatedAt: number }[]>([]);
+  // Spending cap — hard stop on Gemini spend per session. Persisted across reloads.
+  const [spendCapUsd, setSpendCapUsd] = useState<number>(5);
+  const [budgetConfirm, setBudgetConfirm] = useState<{
+    message: string;
+    cost: number;
+    onConfirm: () => void;
+    onCancel: () => void;
+  } | null>(null);
 
   // Save / load decks via localStorage
   useEffect(() => {
@@ -218,7 +226,58 @@ export default function Home() {
       const idx = JSON.parse(localStorage.getItem('slidegen.deckIndex') || '[]') as typeof savedDecks;
       if (Array.isArray(idx)) setSavedDecks(idx.sort((a, b) => b.updatedAt - a.updatedAt));
     } catch { /* ignore */ }
+    // Restore the spending cap
+    try {
+      const cap = localStorage.getItem('slidegen.spendCapUsd');
+      if (cap !== null) {
+        const n = Number(cap);
+        if (Number.isFinite(n) && n >= 0) setSpendCapUsd(n);
+      }
+    } catch { /* ignore */ }
   }, []);
+
+  // Persist the spending cap when it changes
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try { localStorage.setItem('slidegen.spendCapUsd', String(spendCapUsd)); } catch { /* ignore */ }
+  }, [spendCapUsd]);
+
+  /**
+   * Pre-flight budget guard. Returns true if the action should proceed; false if the
+   * user explicitly denied or the cap is already exceeded. If the projected cost would
+   * push us over the cap, opens a confirm dialog and resolves only after the user picks.
+   */
+  function checkBudget(projectedCost: number, label: string): Promise<boolean> {
+    return new Promise((resolveBudget) => {
+      // Cap = 0 means unlimited (user opted out)
+      if (spendCapUsd <= 0) return resolveBudget(true);
+      const after = sessionCostUsd + projectedCost;
+      if (after <= spendCapUsd) return resolveBudget(true);
+      // Over the cap — open the confirm dialog
+      const remaining = Math.max(0, spendCapUsd - sessionCostUsd);
+      const overBy = after - spendCapUsd;
+      setBudgetConfirm({
+        message:
+          remaining <= 0
+            ? `You've already hit the ${formatUsd(spendCapUsd)} session cap. ${label} would cost another ${formatUsd(projectedCost)}.`
+            : `${label} would cost ${formatUsd(projectedCost)}, putting this session at ${formatUsd(after)} — ${formatUsd(overBy)} over your ${formatUsd(spendCapUsd)} cap.`,
+        cost: projectedCost,
+        onConfirm: () => {
+          setBudgetConfirm(null);
+          resolveBudget(true);
+        },
+        onCancel: () => {
+          setBudgetConfirm(null);
+          resolveBudget(false);
+        },
+      });
+    });
+  }
+
+  function resetSessionSpend() {
+    setSessionCostUsd(0);
+    toast.success('Session spend reset to $0.');
+  }
 
   function saveCurrentDeck() {
     if (!deck) return;
@@ -463,9 +522,14 @@ export default function Home() {
     return data.review as Review;
   }
 
-  async function generateOne(slide: Slide, opts: { review?: boolean } = {}) {
+  async function generateOne(slide: Slide, opts: { review?: boolean; skipBudgetCheck?: boolean } = {}) {
     if (slide.imageAspect === 'none') return; // text-only layout, nothing to do
     const useReview = opts.review ?? autoReview;
+    if (!opts.skipBudgetCheck) {
+      const projected = NANO_BANANA_PRICE_PER_IMAGE_USD * (useReview ? 1 + MAX_REVIEW_RETRIES : 1);
+      const ok = await checkBudget(projected, `Generating slide ${slide.n}${useReview ? ' (with review retries)' : ''}`);
+      if (!ok) return;
+    }
     setBusySlides((s) => new Set(s).add(slide.n));
     setStatus(slide.n, 'Generating image…');
     try {
@@ -508,14 +572,19 @@ export default function Home() {
 
   async function generateAll() {
     if (!deck) return;
-    setPhase('generating');
     const targets = deck.slides.filter((s) => s.imageAspect !== 'none');
-    // Parallel with concurrency cap
+    // Single budget check up front for the whole batch (worst case w/ review retries)
+    const perImage = NANO_BANANA_PRICE_PER_IMAGE_USD * (autoReview ? 1 + MAX_REVIEW_RETRIES : 1);
+    const projected = targets.length * perImage;
+    const ok = await checkBudget(projected, `Generating all ${targets.length} images${autoReview ? ' (with review retries)' : ''}`);
+    if (!ok) return;
+    setPhase('generating');
     let cursor = 0;
     async function worker() {
       while (cursor < targets.length) {
         const idx = cursor++;
-        await generateOne(targets[idx]);
+        // Each individual gen skips its own check — already approved as a batch
+        await generateOne(targets[idx], { skipBudgetCheck: true });
       }
     }
     await Promise.all(Array.from({ length: Math.min(PARALLEL_GEN_LIMIT, targets.length) }, worker));
@@ -524,6 +593,9 @@ export default function Home() {
 
   async function generateVariations(slide: Slide) {
     if (!deck || slide.imageAspect === 'none') return;
+    const projected = NANO_BANANA_PRICE_PER_IMAGE_USD * 3;
+    const ok = await checkBudget(projected, `3 variations for slide ${slide.n}`);
+    if (!ok) return;
     setVariationsModal({ slideN: slide.n, loading: true, options: [], cost: 0 });
     try {
       const res = await fetch('/api/generate-variations', {
@@ -721,11 +793,11 @@ export default function Home() {
               Local Nano Banana slide generator — planned by Claude Code, exported as .pptx.
             </p>
           </div>
-          <div className="text-right">
-            <div className="text-xs uppercase text-muted-foreground tracking-wider">Session</div>
-            <div className="font-mono text-lg">{formatUsd(sessionCostUsd)}</div>
-            <div className="text-[10px] text-muted-foreground">Nano Banana spend (Claude is on your CC plan)</div>
-          </div>
+          <BudgetMeter
+            spent={sessionCostUsd}
+            cap={spendCapUsd}
+            onReset={resetSessionSpend}
+          />
         </header>
 
         {(phase === 'idle' || phase === 'planning') && (
@@ -849,6 +921,40 @@ export default function Home() {
                 </div>
               </div>
 
+              <div className="space-y-2 border-t pt-3">
+                <Label htmlFor="spendCap" className="text-xs uppercase tracking-wider opacity-70">
+                  Spending cap (per session)
+                </Label>
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-2 flex-1">
+                    <span className="text-sm text-muted-foreground">$</span>
+                    <Input
+                      id="spendCap"
+                      type="number"
+                      min={0}
+                      step={0.5}
+                      value={spendCapUsd}
+                      onChange={(e) => setSpendCapUsd(Math.max(0, Number(e.target.value) || 0))}
+                      className="w-28 font-mono"
+                    />
+                    <span className="text-xs text-muted-foreground">
+                      {spendCapUsd <= 0
+                        ? '(unlimited — you will not be warned)'
+                        : `Hard stop on Nano Banana spend. ~${Math.floor(spendCapUsd / NANO_BANANA_PRICE_PER_IMAGE_USD)} images max.`}
+                    </span>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setSpendCapUsd(0)}
+                    disabled={spendCapUsd <= 0 || phase === 'planning'}
+                    title="Disable the cap"
+                  >
+                    no cap
+                  </Button>
+                </div>
+              </div>
+
               {savedDecks.length > 0 && (
                 <div className="space-y-2 border-t pt-3">
                   <Label className="text-xs uppercase tracking-wider opacity-70">Recent decks</Label>
@@ -935,6 +1041,17 @@ export default function Home() {
             modal={variationsModal}
             close={() => setVariationsModal(null)}
             apply={applyVariation}
+          />
+        )}
+
+        {budgetConfirm && (
+          <BudgetConfirmDialog
+            message={budgetConfirm.message}
+            spent={sessionCostUsd}
+            cap={spendCapUsd}
+            cost={budgetConfirm.cost}
+            onConfirm={budgetConfirm.onConfirm}
+            onCancel={budgetConfirm.onCancel}
           />
         )}
       </div>
@@ -1462,6 +1579,107 @@ function DraggableOutline({
           </button>
         );
       })}
+    </div>
+  );
+}
+
+function BudgetMeter({ spent, cap, onReset }: { spent: number; cap: number; onReset: () => void }) {
+  if (cap <= 0) {
+    return (
+      <div className="text-right">
+        <div className="text-[10px] uppercase text-muted-foreground tracking-wider">Session</div>
+        <div className="font-mono text-lg leading-tight">{formatUsd(spent)}</div>
+        <div className="flex items-center gap-2 justify-end">
+          <span className="text-[10px] text-muted-foreground">no cap set</span>
+          {spent > 0 && (
+            <button onClick={onReset} className="text-[10px] underline opacity-60 hover:opacity-100">
+              reset
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+  const pct = Math.min(100, (spent / cap) * 100);
+  // Color tier: under 60% green, 60-90% amber, 90%+ red
+  const tier = pct < 60 ? 'ok' : pct < 90 ? 'warn' : 'danger';
+  const fillColor =
+    tier === 'ok' ? 'rgb(16 185 129)' : tier === 'warn' ? 'rgb(234 179 8)' : 'rgb(239 68 68)';
+  return (
+    <div className="text-right min-w-[180px]">
+      <div className="flex items-baseline justify-end gap-2">
+        <span className="text-[10px] uppercase text-muted-foreground tracking-wider">Session</span>
+        <button onClick={onReset} className="text-[10px] underline opacity-60 hover:opacity-100" title="Reset session spend to $0">
+          reset
+        </button>
+      </div>
+      <div className="font-mono text-lg leading-tight tabular-nums">
+        <span style={{ color: tier === 'danger' ? fillColor : undefined }}>{formatUsd(spent)}</span>
+        <span className="text-muted-foreground"> / {formatUsd(cap)}</span>
+      </div>
+      <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden mt-1">
+        <div
+          className="h-full transition-all duration-300"
+          style={{ width: `${pct}%`, background: fillColor }}
+        />
+      </div>
+      <div className="text-[10px] text-muted-foreground mt-0.5">
+        Nano Banana spend · Claude on your CC plan
+      </div>
+    </div>
+  );
+}
+
+function BudgetConfirmDialog({
+  message,
+  spent,
+  cap,
+  cost,
+  onConfirm,
+  onCancel,
+}: {
+  message: string;
+  spent: number;
+  cap: number;
+  cost: number;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-6"
+      onClick={onCancel}
+    >
+      <div
+        className="bg-background border rounded-lg shadow-2xl max-w-md w-full"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="p-5 space-y-4">
+          <div className="flex items-center gap-3">
+            <div className="size-10 rounded-full flex items-center justify-center bg-amber-500/10 text-amber-600 dark:text-amber-400 font-bold">
+              !
+            </div>
+            <div>
+              <div className="font-semibold">Spending cap reached</div>
+              <div className="text-xs text-muted-foreground">
+                Session: {formatUsd(spent)} · Cap: {formatUsd(cap)} · This action: {formatUsd(cost)}
+              </div>
+            </div>
+          </div>
+          <p className="text-sm leading-relaxed">{message}</p>
+          <p className="text-xs text-muted-foreground">
+            You can raise the cap in the planner before generating, or click Override to spend over the cap just this once.
+          </p>
+        </div>
+        <div className="border-t p-3 flex justify-end gap-2 bg-muted/30">
+          <Button variant="ghost" size="sm" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button size="sm" onClick={onConfirm}>
+            Override and spend {formatUsd(cost)}
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }
