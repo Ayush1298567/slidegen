@@ -20,7 +20,7 @@ Runs entirely on your machine. Your `claude` CLI subscription handles the planni
 ## Setup
 
 ```bash
-git clone https://github.com/Ayush1298567/slidegen.git
+git clone https://github.com/ayushg8/slidegen.git
 cd slidegen
 pnpm install
 cp .env.local.example .env.local
