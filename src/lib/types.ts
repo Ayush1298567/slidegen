@@ -119,15 +119,27 @@ export type ThemePreset = {
   id: ThemePresetId;
   label: string;
   description: string;
-  /** When non-null, this exact theme is used (Claude won't invent one). */
+  /** When non-null, this exact theme is used (the model won't invent one). */
   theme: Theme | null;
 };
+
+// Which LLM handles the text work (plan / refine / review).
+// `claude` uses your local Claude Code CLI. `deepseek` calls the DeepSeek API
+// (text-only — no vision, so per-slide image review is unavailable).
+export type LlmProvider = 'claude' | 'deepseek';
+
+export const LLM_PROVIDERS: LlmProvider[] = ['claude', 'deepseek'];
+
+/** Coerce an unknown value (e.g. a request body field) into a valid provider. */
+export function toLlmProvider(value: unknown): LlmProvider {
+  return value === 'deepseek' ? 'deepseek' : 'claude';
+}
 
 export const THEME_PRESETS: ThemePreset[] = [
   {
     id: 'auto',
     label: 'Auto',
-    description: "Let Claude pick the theme based on your topic",
+    description: 'Let the model pick the theme based on your topic',
     theme: null,
   },
   {

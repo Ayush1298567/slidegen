@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { reviewDeck } from '@/lib/claude-client';
-import type { Deck } from '@/lib/types';
+import { toLlmProvider, type Deck } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -10,7 +10,8 @@ export async function POST(req: Request) {
     const body = await req.json();
     const deck = body?.deck as Deck | undefined;
     if (!deck) return NextResponse.json({ error: 'deck required' }, { status: 400 });
-    const result = await reviewDeck(deck);
+    const provider = toLlmProvider(body?.provider);
+    const result = await reviewDeck(deck, provider);
     return NextResponse.json(result);
   } catch (err) {
     return NextResponse.json(

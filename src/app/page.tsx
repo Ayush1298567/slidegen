@@ -25,10 +25,12 @@ import {
   ALL_LAYOUTS,
   LAYOUT_IMAGE_ASPECT,
   THEME_PRESETS,
+  toLlmProvider,
   type DeckAspect,
   type DeckTemplate,
   type Deck,
   type Layout,
+  type LlmProvider,
   type Slide,
   type ThemePresetId,
   type Theme,
@@ -50,11 +52,22 @@ type SlideImage = {
 
 const MAX_REVIEW_RETRIES = 2;
 
+// Which LLM does the text work (plan / refine / review). Claude is the default;
+// DeepSeek is text-only so the per-slide image review is disabled for it.
+const LLM_PROVIDERS: { id: LlmProvider; label: string }[] = [
+  { id: 'claude', label: 'Claude' },
+  { id: 'deepseek', label: 'DeepSeek' },
+];
+const LLM_LABEL: Record<LlmProvider, string> = {
+  claude: 'Claude',
+  deepseek: 'DeepSeek',
+};
+
 type Phase = 'idle' | 'planning' | 'plan-ready' | 'generating' | 'done';
 
 type StreamEvent =
   | { type: 'status'; text: string }
-  | { type: 'result'; deck?: unknown; claudeCostUsd?: number | null }
+  | { type: 'result'; deck?: unknown; llmCostUsd?: number | null }
   | { type: 'error'; error: string };
 
 async function readNdjson(
@@ -212,6 +225,8 @@ export default function Home() {
   const [savedDecks, setSavedDecks] = useState<{ id: string; title: string; updatedAt: number }[]>([]);
   // Spending cap — hard stop on Gemini spend per session. Persisted across reloads.
   const [spendCapUsd, setSpendCapUsd] = useState<number>(5);
+  // Which LLM provider plans/refines/reviews the deck. Persisted across reloads.
+  const [provider, setProvider] = useState<LlmProvider>('claude');
   const [budgetConfirm, setBudgetConfirm] = useState<{
     message: string;
     cost: number;
@@ -234,6 +249,10 @@ export default function Home() {
         if (Number.isFinite(n) && n >= 0) setSpendCapUsd(n);
       }
     } catch { /* ignore */ }
+    // Restore the last-used planning model
+    try {
+      setProvider(toLlmProvider(localStorage.getItem('slidegen.provider')));
+    } catch { /* ignore */ }
   }, []);
 
   // Persist the spending cap when it changes
@@ -241,6 +260,12 @@ export default function Home() {
     if (typeof window === 'undefined') return;
     try { localStorage.setItem('slidegen.spendCapUsd', String(spendCapUsd)); } catch { /* ignore */ }
   }, [spendCapUsd]);
+
+  // Persist the planning model when it changes
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try { localStorage.setItem('slidegen.provider', provider); } catch { /* ignore */ }
+  }, [provider]);
 
   /**
    * Pre-flight budget guard. Returns true if the action should proceed; false if the
@@ -362,7 +387,7 @@ export default function Home() {
     setSessionCostUsd(0);
     setChatMessages([]);
     setDeckReview(null);
-    setPlanStatus('Asking Claude…');
+    setPlanStatus(`Asking ${LLM_LABEL[provider]}…`);
     const preset = THEME_PRESETS.find((p) => p.id === themePresetId);
     const themeOverride: Theme | undefined = preset?.theme ?? undefined;
     const brandPrimaryClean = brandPrimary.trim().match(/^#[0-9a-f]{6}$/i) ? brandPrimary.trim() : undefined;
@@ -378,6 +403,7 @@ export default function Home() {
           styleHint: styleHint.trim() || undefined,
           themeOverride,
           brandPrimary: brandPrimaryClean,
+          provider,
         },
         (evt) => {
           if (evt.type === 'status') setPlanStatus(evt.text);
@@ -503,8 +529,8 @@ export default function Home() {
   async function callReview(slide: Slide, dataUrl: string, prompt: string): Promise<Review> {
     if (!deck) throw new Error('no deck');
     // Send the WHOLE slide (with the just-generated image) so /api/review can
-    // screenshot the composed slide and have Claude assess the final result —
-    // not just the raw Nano Banana image.
+    // screenshot the composed slide and have the model assess the final result —
+    // not just the raw Nano Banana image. (Vision: Claude Code or Gemini.)
     const slideWithCurrentPrompt: Slide = { ...slide, imagePrompt: prompt };
     const res = await fetch('/api/review', {
       method: 'POST',
@@ -515,6 +541,7 @@ export default function Home() {
         imageDataUrl: dataUrl,
         aspect: '16:9',
         chrome: { deckTitle: deck.title, pageTotal: deck.slides.length },
+        provider,
       }),
     });
     const data = await res.json();
@@ -524,6 +551,8 @@ export default function Home() {
 
   async function generateOne(slide: Slide, opts: { review?: boolean; skipBudgetCheck?: boolean } = {}) {
     if (slide.imageAspect === 'none') return; // text-only layout, nothing to do
+    // Image review is vision-based: Claude Code when provider=claude, Gemini when
+    // provider=deepseek (see /api/review). It runs for both providers.
     const useReview = opts.review ?? autoReview;
     if (!opts.skipBudgetCheck) {
       const projected = NANO_BANANA_PRICE_PER_IMAGE_USD * (useReview ? 1 + MAX_REVIEW_RETRIES : 1);
@@ -541,11 +570,11 @@ export default function Home() {
 
       if (useReview) {
         for (let attempt = 0; attempt < MAX_REVIEW_RETRIES; attempt++) {
-          setStatus(slide.n, `Claude reviewing (pass ${attempt + 1})…`);
+          setStatus(slide.n, `AI reviewing (pass ${attempt + 1})…`);
           review = await callReview(slide, last.dataUrl, prompt);
           if (review.verdict === 'approve' || !review.improvedPrompt) break;
           prompt = review.improvedPrompt;
-          setStatus(slide.n, `Regenerating with Claude's notes (try ${attempt + 2})…`);
+          setStatus(slide.n, `Regenerating from review notes (try ${attempt + 2})…`);
           last = await callGenerate(prompt, slide);
           totalCost += last.costUsd;
           iterations += 1;
@@ -643,7 +672,7 @@ export default function Home() {
       const res = await fetch('/api/deck-review', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ deck }),
+        body: JSON.stringify({ deck, provider }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || 'review failed');
@@ -698,7 +727,7 @@ export default function Home() {
     try {
       let updated: Deck | null = null;
       let errMsg: string | null = null;
-      await readNdjson('/api/refine', { deck, instruction: text }, (evt) => {
+      await readNdjson('/api/refine', { deck, instruction: text, provider }, (evt) => {
         if (evt.type === 'status') {
           setChatMessages((m) =>
             m.map((msg, i) => (i === placeholderIdx ? { ...msg, text: evt.text } : msg)),
@@ -790,13 +819,14 @@ export default function Home() {
           <div>
             <h1 className="text-3xl font-semibold tracking-tight">slidegen</h1>
             <p className="text-sm text-muted-foreground">
-              Local Nano Banana slide generator — planned by Claude Code, exported as .pptx.
+              Local-first AI slide generator — {LLM_LABEL[provider]} plans the deck, Nano Banana renders imagery, exported as .pptx.
             </p>
           </div>
           <BudgetMeter
             spent={sessionCostUsd}
             cap={spendCapUsd}
             onReset={resetSessionSpend}
+            provider={provider}
           />
         </header>
 
@@ -921,6 +951,29 @@ export default function Home() {
                 </div>
               </div>
 
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div className="space-y-2 sm:col-span-1">
+                  <Label htmlFor="plannerModel">Planning model</Label>
+                  <Select
+                    value={provider}
+                    onValueChange={(v) => setProvider(v as LlmProvider)}
+                    disabled={phase === 'planning'}
+                  >
+                    <SelectTrigger id="plannerModel" className="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {LLM_PROVIDERS.map((p) => (
+                        <SelectItem key={p.id} value={p.id}>{p.label}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <p className="sm:col-span-2 text-xs text-muted-foreground leading-relaxed self-end pb-1">
+                  {provider === 'claude'
+                    ? 'Claude Code plans, refines, and reviews on your machine — no API key needed.'
+                    : 'DeepSeek plans & refines via API key. DeepSeek is text-only, so slide images are auto-reviewed by Gemini instead — no Claude needed.'}
+                </p>
+              </div>
+
               <div className="space-y-2 border-t pt-3">
                 <Label htmlFor="spendCap" className="text-xs uppercase tracking-wider opacity-70">
                   Spending cap (per session)
@@ -992,7 +1045,7 @@ export default function Home() {
                 )}
               </div>
               <p className="text-xs text-muted-foreground">
-                Claude picks layouts, writes content, and chooses a cohesive theme (color palette + fonts). Image generation costs {formatUsd(NANO_BANANA_PRICE_PER_IMAGE_USD)} per image (text-only slides like agendas/comparisons cost $0).
+                {LLM_LABEL[provider]} picks layouts, writes content, and chooses a cohesive theme (color palette + fonts). Image generation costs {formatUsd(NANO_BANANA_PRICE_PER_IMAGE_USD)} per image (text-only slides like agendas/comparisons cost $0).
               </p>
             </CardContent>
           </Card>
@@ -1033,6 +1086,7 @@ export default function Home() {
             deckReview={deckReview}
             runDeckReview={runDeckReview}
             deckReviewing={deckReviewing}
+            provider={provider}
           />
         )}
 
@@ -1099,6 +1153,7 @@ type WorkspaceProps = {
   } | null;
   runDeckReview: () => void;
   deckReviewing: boolean;
+  provider: LlmProvider;
 };
 
 function DeckWorkspace(p: WorkspaceProps) {
@@ -1333,7 +1388,7 @@ function DeckWorkspace(p: WorkspaceProps) {
 
             {p.images[p.selectedSlideN]?.review?.issues.length ? (
               <div className="text-[10px] text-muted-foreground space-y-0.5 pt-2 border-t">
-                <div className="font-medium">Claude review:</div>
+                <div className="font-medium">AI review:</div>
                 {p.images[p.selectedSlideN]!.review!.issues.map((iss, i) => (
                   <div key={i}>· {iss}</div>
                 ))}
@@ -1352,9 +1407,11 @@ function DeckWorkspace(p: WorkspaceProps) {
                 className="mt-1 size-4"
               />
               <div>
-                <div className="text-sm font-medium">Auto-review with Claude</div>
+                <div className="text-sm font-medium">Auto-review</div>
                 <div className="text-xs text-muted-foreground">
-                  Claude inspects each image and re-prompts up to {MAX_REVIEW_RETRIES}× if it can be improved. Adds {formatUsd(NANO_BANANA_PRICE_PER_IMAGE_USD)} per retry.
+                  {p.provider === 'claude'
+                    ? `Claude (Claude Code) inspects each composed slide and re-prompts up to ${MAX_REVIEW_RETRIES}× if it can be improved. Adds ${formatUsd(NANO_BANANA_PRICE_PER_IMAGE_USD)} per retry.`
+                    : `DeepSeek is text-only, so Gemini (vision) inspects each composed slide instead, re-prompting up to ${MAX_REVIEW_RETRIES}× if it can be improved. Adds ${formatUsd(NANO_BANANA_PRICE_PER_IMAGE_USD)} per retry.`}
                 </div>
               </div>
             </label>
@@ -1380,7 +1437,7 @@ function DeckWorkspace(p: WorkspaceProps) {
                   size="sm"
                   onClick={p.runDeckReview}
                   disabled={p.deckReviewing}
-                  title="Have Claude review the whole deck"
+                  title={`Have ${LLM_LABEL[p.provider]} review the whole deck`}
                 >
                   {p.deckReviewing ? 'Reviewing…' : 'Review deck'}
                 </Button>
@@ -1443,7 +1500,7 @@ function DeckWorkspace(p: WorkspaceProps) {
       <Card className="col-span-3 sticky top-4 self-start max-h-[calc(100vh-2rem)] flex flex-col">
         <CardHeader className="pb-2">
           <CardTitle className="text-sm flex items-center gap-2">
-            Refine with Claude
+            Refine with {LLM_LABEL[p.provider]}
             {p.refining && <span className="text-xs text-muted-foreground">thinking…</span>}
           </CardTitle>
         </CardHeader>
@@ -1451,7 +1508,7 @@ function DeckWorkspace(p: WorkspaceProps) {
           <div className="flex-1 overflow-y-auto space-y-2 text-xs">
             {p.chatMessages.length === 0 && (
               <div className="text-muted-foreground space-y-1">
-                <div>Ask Claude to revise the deck. Try:</div>
+                <div>Ask {LLM_LABEL[p.provider]} to revise the deck. Try:</div>
                 <div className="italic opacity-80">&quot;Make slide 3 punchier.&quot;</div>
                 <div className="italic opacity-80">&quot;Add a slide about pricing.&quot;</div>
                 <div className="italic opacity-80">&quot;Swap to a darker palette.&quot;</div>
@@ -1471,7 +1528,7 @@ function DeckWorkspace(p: WorkspaceProps) {
           </div>
           <div className="space-y-2">
             <Textarea
-              placeholder="What should Claude change?"
+              placeholder={`What should ${LLM_LABEL[p.provider]} change?`}
               value={p.chatInput}
               onChange={(e) => p.setChatInput(e.target.value)}
               rows={2}
@@ -1583,7 +1640,17 @@ function DraggableOutline({
   );
 }
 
-function BudgetMeter({ spent, cap, onReset }: { spent: number; cap: number; onReset: () => void }) {
+function BudgetMeter({
+  spent,
+  cap,
+  onReset,
+  provider,
+}: {
+  spent: number;
+  cap: number;
+  onReset: () => void;
+  provider: LlmProvider;
+}) {
   if (cap <= 0) {
     return (
       <div className="text-right">
@@ -1624,7 +1691,7 @@ function BudgetMeter({ spent, cap, onReset }: { spent: number; cap: number; onRe
         />
       </div>
       <div className="text-[10px] text-muted-foreground mt-0.5">
-        Nano Banana spend · Claude on your CC plan
+        Nano Banana spend · {provider === 'claude' ? 'Claude on your CC plan' : 'DeepSeek billed by token'}
       </div>
     </div>
   );

@@ -1,5 +1,5 @@
 import { startPlan, streamEvents } from '@/lib/claude-client';
-import type { DeckTemplate, Theme } from '@/lib/types';
+import { toLlmProvider, type DeckTemplate, type LlmProvider, type Theme } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -19,6 +19,7 @@ export async function POST(req: Request) {
   let template: DeckTemplate = 'custom';
   let themeOverride: Theme | undefined;
   let brandPrimary: string | undefined;
+  let provider: LlmProvider = 'claude';
   try {
     const body = await req.json();
     topic = String(body?.topic ?? '').trim();
@@ -31,6 +32,7 @@ export async function POST(req: Request) {
     if (typeof body?.brandPrimary === 'string' && /^#[0-9a-f]{6}$/i.test(body.brandPrimary.trim())) {
       brandPrimary = body.brandPrimary.trim();
     }
+    provider = toLlmProvider(body?.provider);
   } catch {
     return Response.json({ error: 'invalid body' }, { status: 400 });
   }
@@ -42,8 +44,8 @@ export async function POST(req: Request) {
         try { controller.enqueue(ndjson(obj)); } catch { /* closed */ }
       };
       try {
-        send({ type: 'status', text: 'Spawning Claude…' });
-        const { sessionId } = await startPlan({ topic, slideCount, styleHint, template, themeOverride, brandPrimary });
+        send({ type: 'status', text: `Spawning ${provider === 'deepseek' ? 'DeepSeek' : 'Claude'}…` });
+        const { sessionId } = await startPlan({ topic, slideCount, styleHint, template, themeOverride, brandPrimary, provider });
         let finalResult: unknown = null;
         let finalError: string | null = null;
         await streamEvents(sessionId, (evt) => {

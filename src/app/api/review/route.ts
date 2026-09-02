@@ -3,8 +3,9 @@ import { writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { reviewSlide } from '@/lib/claude-client';
+import { reviewSlideImage as geminiReviewSlide } from '@/lib/gemini-review';
 import { screenshotSlide } from '@/lib/screenshot';
-import type { Slide, Theme, DeckAspect } from '@/lib/types';
+import { toLlmProvider, type DeckAspect, type LlmProvider, type Slide, type Theme } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -28,6 +29,11 @@ type ReviewBody = {
   aspect?: DeckAspect;
   /** Optional context for slide chrome (deck wordmark + page count). */
   chrome?: { deckTitle: string; pageTotal: number };
+  /**
+   * Text provider for the deck. claude → Claude Code reads the screenshot;
+   * deepseek → DeepSeek is text-only, so Gemini (vision) reviews it instead.
+   */
+  provider?: LlmProvider;
 };
 
 export async function POST(req: Request) {
@@ -37,6 +43,7 @@ export async function POST(req: Request) {
     if (!body?.slide || !body?.theme) {
       return NextResponse.json({ error: 'slide and theme required' }, { status: 400 });
     }
+    const provider = toLlmProvider(body?.provider);
 
     // Render the COMPOSED slide (image + text overlay) and screenshot it.
     const { pngBuffer } = await screenshotSlide({
@@ -47,6 +54,19 @@ export async function POST(req: Request) {
       chrome: body.chrome,
     });
 
+    // DeepSeek's chat models are text-only, so its slide review is delegated to
+    // Gemini (vision) instead — no Claude involved anywhere in this path.
+    if (provider === 'deepseek') {
+      const result = await geminiReviewSlide({
+        imageDataUrl: `data:image/png;base64,${pngBuffer.toString('base64')}`,
+        imagePrompt: body.slide.imagePrompt,
+        style: body.theme.mood,
+        slideTitle: body.slide.title,
+      });
+      return NextResponse.json({ review: result.review, llmCostUsd: result.costUsd });
+    }
+
+    // Claude provider → Claude Code reads the screenshot from disk.
     mkdirSync(TEMP_DIR, { recursive: true });
     tempPath = join(TEMP_DIR, `${randomBytes(8).toString('hex')}.png`);
     writeFileSync(tempPath, pngBuffer);
@@ -56,6 +76,7 @@ export async function POST(req: Request) {
       imagePrompt: body.slide.imagePrompt,
       style: body.theme.mood,
       slideTitle: body.slide.title,
+      provider,
     });
     return NextResponse.json(result);
   } catch (err) {
