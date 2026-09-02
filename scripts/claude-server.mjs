@@ -30,6 +30,24 @@ const SHUTDOWN_AFTER_MS = 1000 * 60 * 30; // idle timeout
 
 const CLAUDE_BIN = process.env.SLIDEGEN_CLAUDE_BIN || 'claude';
 
+// --- Provider configuration (claude | deepseek) --------------------------
+// `claude`  → spawn the local Claude Code CLI (existing behavior).
+// `deepseek`→ call the DeepSeek API directly (no Claude Code needed).
+// Provider can be forced via SLIDEGEN_PROVIDER and/or overridden per request.
+const DEFAULT_PROVIDER = process.env.SLIDEGEN_PROVIDER === 'deepseek' ? 'deepseek' : 'claude';
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
+const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com').replace(/\/+$/, '');
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
+// DeepSeek pricing in $ per 1M tokens — approximate; override via env if rates change.
+const DEEPSEEK_INPUT_USD_PER_MTOKEN = Number(process.env.DEEPSEEK_INPUT_USD_PER_MTOKEN ?? 0.27);
+const DEEPSEEK_OUTPUT_USD_PER_MTOKEN = Number(process.env.DEEPSEEK_OUTPUT_USD_PER_MTOKEN ?? 1.1);
+const PROVIDER_LABEL = { claude: 'Claude', deepseek: 'DeepSeek' };
+
+function resolveProvider(value) {
+  if (value === 'claude' || value === 'deepseek') return value;
+  return DEFAULT_PROVIDER;
+}
+
 const sessions = new Map(); // id → { events: [], done: bool, error?, result? }
 let lastActivity = Date.now();
 
@@ -127,6 +145,72 @@ function runClaude({ prompt, sessionId }) {
   });
 }
 
+// Run a single DeepSeek completion via their OpenAI-compatible HTTP API.
+// Returns { text, costUsd }. Text-only: DeepSeek models have no vision, so the
+// screenshot-review endpoint rejects provider=deepseek (see handleReview).
+async function runDeepSeek({ prompt, sessionId }) {
+  if (!DEEPSEEK_API_KEY) {
+    throw new Error(
+      'DEEPSEEK_API_KEY is not set. Add it to .env.local (see .env.local.example) to use DeepSeek.',
+    );
+  }
+  pushEvent(sessionId, { type: 'stdout', text: `\n[deepseek] calling ${DEEPSEEK_MODEL}…\n` });
+  const res = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${DEEPSEEK_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: DEEPSEEK_MODEL,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are an expert presentation designer. Follow the user\'s instructions exactly and output ONLY valid JSON — no prose, no markdown fences, no commentary.',
+        },
+        { role: 'user', content: prompt },
+      ],
+      stream: false,
+      max_tokens: 8192,
+    }),
+  });
+
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const errBody = await res.json();
+      detail = errBody?.error?.message || JSON.stringify(errBody).slice(0, 300);
+    } catch {
+      detail = res.statusText;
+    }
+    throw new Error(`DeepSeek API ${res.status}: ${detail}`);
+  }
+
+  const data = await res.json();
+  const text = data?.choices?.[0]?.message?.content;
+  if (typeof text !== 'string' || !text.trim()) {
+    throw new Error('DeepSeek returned an empty response.');
+  }
+  const usage = data?.usage;
+  const costUsd =
+    usage && Number.isFinite(usage.prompt_tokens) && Number.isFinite(usage.completion_tokens)
+      ? (usage.prompt_tokens / 1e6) * DEEPSEEK_INPUT_USD_PER_MTOKEN +
+        (usage.completion_tokens / 1e6) * DEEPSEEK_OUTPUT_USD_PER_MTOKEN
+      : null;
+  return { text, costUsd };
+}
+
+// Normalized transport: returns { text, costUsd, rawWrapper } for both providers.
+async function runLLM({ provider, prompt, sessionId }) {
+  if (resolveProvider(provider) === 'deepseek') {
+    const r = await runDeepSeek({ prompt, sessionId });
+    return { text: r.text, costUsd: r.costUsd, rawWrapper: null };
+  }
+  const r = await runClaude({ prompt, sessionId });
+  return { text: r.text, costUsd: r.rawWrapper?.total_cost_usd ?? null, rawWrapper: r.rawWrapper };
+}
+
 // Extract a JSON object/array from a possibly-fenced/text response.
 function extractJson(text) {
   if (!text) throw new Error('empty response from claude');
@@ -147,7 +231,7 @@ function extractJson(text) {
     try { return JSON.parse(obj[0]); } catch {}
   }
 
-  throw new Error(`could not extract JSON from claude output: ${trimmed.slice(0, 200)}`);
+  throw new Error(`could not extract JSON from model output: ${trimmed.slice(0, 200)}`);
 }
 
 const TEMPLATE_GUIDANCE = {
@@ -471,6 +555,7 @@ function validateDeck(deck, expectedCount) {
 async function handlePlan(req, res) {
   touch();
   const body = await readBody(req);
+  const provider = resolveProvider(body.provider);
   const { topic, slideCount = 10, styleHint, template = 'custom', themeOverride, brandPrimary } = body;
   if (!topic || typeof topic !== 'string') {
     return jsonResponse(res, 400, { error: 'topic required' });
@@ -480,16 +565,17 @@ async function handlePlan(req, res) {
 
   (async () => {
     try {
-      pushEvent(sessionId, { type: 'status', text: 'Claude is designing the deck…' });
+      pushEvent(sessionId, { type: 'status', text: `${PROVIDER_LABEL[provider]} is designing the deck…` });
       let deck;
       let totalCost = 0;
       let lastError = null;
       for (let attempt = 1; attempt <= 2; attempt++) {
-        const { text, rawWrapper } = await runClaude({
+        const { text, costUsd } = await runLLM({
+          provider,
           prompt: planPrompt({ topic, slideCount, styleHint, template, themeOverride, brandPrimary }),
           sessionId,
         });
-        totalCost += rawWrapper?.total_cost_usd ?? 0;
+        totalCost += costUsd ?? 0;
         try {
           deck = extractJson(text);
         } catch (e) {
@@ -508,7 +594,7 @@ async function handlePlan(req, res) {
       }
       if (!deck) throw new Error(lastError || 'failed to produce a valid plan');
       const session = sessions.get(sessionId);
-      session.result = { deck, claudeCostUsd: totalCost };
+      session.result = { deck, llmCostUsd: totalCost || null };
       session.done = true;
       pushEvent(sessionId, { type: 'done', result: session.result });
     } catch (err) {
@@ -523,6 +609,7 @@ async function handlePlan(req, res) {
 async function handleReview(req, res) {
   touch();
   const body = await readBody(req);
+  const provider = resolveProvider(body.provider);
   const { imagePath, imagePrompt, style, slideTitle } = body;
   if (!imagePath || !style) {
     return jsonResponse(res, 400, { error: 'imagePath and style required' });
@@ -530,19 +617,29 @@ async function handleReview(req, res) {
   if (!existsSync(imagePath)) {
     return jsonResponse(res, 400, { error: `image not found: ${imagePath}` });
   }
+  if (provider === 'deepseek') {
+    // Unreachable from the app (DeepSeek slide review is routed to Gemini in
+    // /api/review); kept as a safety net since the local server only has the
+    // Claude vision path.
+    return jsonResponse(res, 400, {
+      error:
+        'DeepSeek is text-only (no vision). DeepSeek slide review must go through /api/review, which uses Gemini.',
+    });
+  }
   const sessionId = makeSession();
   jsonResponse(res, 202, { sessionId });
 
   (async () => {
     try {
-      pushEvent(sessionId, { type: 'status', text: 'Claude is reviewing the image…' });
-      const { text, rawWrapper } = await runClaude({
+      pushEvent(sessionId, { type: 'status', text: `${PROVIDER_LABEL[provider]} is reviewing the image…` });
+      const { text, costUsd } = await runLLM({
+        provider,
         prompt: reviewPrompt({ imagePath, imagePrompt: imagePrompt || '(text-only slide — no AI image)', style, slideTitle: slideTitle || '' }),
         sessionId,
       });
       const review = extractJson(text);
       const session = sessions.get(sessionId);
-      session.result = { review, claudeCostUsd: rawWrapper?.total_cost_usd ?? null };
+      session.result = { review, llmCostUsd: costUsd ?? null };
       session.done = true;
       pushEvent(sessionId, { type: 'done', result: session.result });
     } catch (err) {
@@ -583,6 +680,7 @@ Be candid. A 7+ deck with minor nits = ship. Otherwise revise.`;
 async function handleDeckReview(req, res) {
   touch();
   const body = await readBody(req);
+  const provider = resolveProvider(body.provider);
   const { deck } = body;
   if (!deck) return jsonResponse(res, 400, { error: 'deck required' });
   const sessionId = makeSession();
@@ -590,14 +688,15 @@ async function handleDeckReview(req, res) {
 
   (async () => {
     try {
-      pushEvent(sessionId, { type: 'status', text: 'Claude is reviewing the whole deck…' });
-      const { text, rawWrapper } = await runClaude({
+      pushEvent(sessionId, { type: 'status', text: `${PROVIDER_LABEL[provider]} is reviewing the whole deck…` });
+      const { text, costUsd } = await runLLM({
+        provider,
         prompt: deckReviewPrompt({ deck }),
         sessionId,
       });
       const review = extractJson(text);
       const session = sessions.get(sessionId);
-      session.result = { review, claudeCostUsd: rawWrapper?.total_cost_usd ?? null };
+      session.result = { review, llmCostUsd: costUsd ?? null };
       session.done = true;
       pushEvent(sessionId, { type: 'done', result: session.result });
     } catch (err) {
@@ -612,6 +711,7 @@ async function handleDeckReview(req, res) {
 async function handleRefine(req, res) {
   touch();
   const body = await readBody(req);
+  const provider = resolveProvider(body.provider);
   const { deck, instruction } = body;
   if (!deck || !instruction) {
     return jsonResponse(res, 400, { error: 'deck and instruction required' });
@@ -621,16 +721,17 @@ async function handleRefine(req, res) {
 
   (async () => {
     try {
-      pushEvent(sessionId, { type: 'status', text: 'Refining deck…' });
+      pushEvent(sessionId, { type: 'status', text: `${PROVIDER_LABEL[provider]} is refining the deck…` });
       let updated;
       let totalCost = 0;
       let lastError = null;
       for (let attempt = 1; attempt <= 2; attempt++) {
-        const { text, rawWrapper } = await runClaude({
+        const { text, costUsd } = await runLLM({
+          provider,
           prompt: refinePrompt({ deck, instruction }),
           sessionId,
         });
-        totalCost += rawWrapper?.total_cost_usd ?? 0;
+        totalCost += costUsd ?? 0;
         try {
           updated = extractJson(text);
         } catch (e) {
@@ -647,7 +748,7 @@ async function handleRefine(req, res) {
       }
       if (!updated) throw new Error(lastError || 'refine failed');
       const session = sessions.get(sessionId);
-      session.result = { deck: updated, claudeCostUsd: totalCost };
+      session.result = { deck: updated, llmCostUsd: totalCost || null };
       session.done = true;
       pushEvent(sessionId, { type: 'done', result: session.result });
     } catch (err) {

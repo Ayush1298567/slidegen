@@ -1,11 +1,12 @@
-// Thin HTTP client for the local Claude server. Mirrors gstack's browse-client.ts:
-// reads the state file, auto-spawns the server if missing or stale, and posts
-// commands. All network traffic is loopback-only.
+// Thin HTTP client for the local LLM server (Claude Code CLI or DeepSeek API).
+// Mirrors gstack's browse-client.ts: reads the state file, auto-spawns the
+// server if missing or stale, and posts commands. All network traffic is
+// loopback-only except the DeepSeek API calls made by the server itself.
 
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import type { Deck, DeckTemplate, Theme } from './types';
+import type { Deck, DeckTemplate, LlmProvider, Theme } from './types';
 
 const ROOT = resolve(process.cwd());
 const STATE_FILE = join(ROOT, '.slidegen', 'claude-server.json');
@@ -156,7 +157,7 @@ export async function streamEvents(
   }
 }
 
-export type PlanResult = { deck: Deck; claudeCostUsd: number | null };
+export type PlanResult = { deck: Deck; llmCostUsd: number | null };
 
 export type Review = {
   verdict: 'approve' | 'improve';
@@ -164,17 +165,19 @@ export type Review = {
   issues: string[];
   improvedPrompt?: string;
 };
-export type ReviewResult = { review: Review; claudeCostUsd: number | null };
+export type ReviewResult = { review: Review; llmCostUsd: number | null };
 
 export type PlanInput = {
   topic: string;
   slideCount: number;
   template: DeckTemplate;
   styleHint?: string;
-  /** When set, Claude must use this exact theme. */
+  /** When set, the model must use this exact theme. */
   themeOverride?: Theme;
-  /** Optional brand primary color (#RRGGBB). Claude harmonizes the rest of the palette. */
+  /** Optional brand primary color (#RRGGBB). The model harmonizes the rest of the palette. */
   brandPrimary?: string;
+  /** Which provider to run this on. Omit to use the server default (claude). */
+  provider?: LlmProvider;
 };
 
 export async function planDeck(input: PlanInput): Promise<PlanResult> {
@@ -189,6 +192,7 @@ export async function startPlan(input: PlanInput): Promise<{ sessionId: string }
 export async function refineDeck(input: {
   deck: Deck;
   instruction: string;
+  provider?: LlmProvider;
 }): Promise<PlanResult> {
   const { sessionId } = await post<{ sessionId: string }>('/refine', input);
   return await getResult<PlanResult>(sessionId);
@@ -197,6 +201,7 @@ export async function refineDeck(input: {
 export async function startRefine(input: {
   deck: Deck;
   instruction: string;
+  provider?: LlmProvider;
 }): Promise<{ sessionId: string }> {
   return await post<{ sessionId: string }>('/refine', input);
 }
@@ -206,6 +211,7 @@ export async function reviewSlide(input: {
   imagePrompt: string;
   style: string;
   slideTitle: string;
+  provider?: LlmProvider;
 }): Promise<ReviewResult> {
   const { sessionId } = await post<{ sessionId: string }>('/review', input);
   return await getResult<ReviewResult>(sessionId);
@@ -218,10 +224,13 @@ export type DeckReview = {
   issues: string[];
   suggestions: string[];
 };
-export type DeckReviewResult = { review: DeckReview; claudeCostUsd: number | null };
+export type DeckReviewResult = { review: DeckReview; llmCostUsd: number | null };
 
-export async function reviewDeck(deck: Deck): Promise<DeckReviewResult> {
-  const { sessionId } = await post<{ sessionId: string }>('/deck-review', { deck });
+export async function reviewDeck(
+  deck: Deck,
+  provider?: LlmProvider,
+): Promise<DeckReviewResult> {
+  const { sessionId } = await post<{ sessionId: string }>('/deck-review', { deck, provider });
   return await getResult<DeckReviewResult>(sessionId);
 }
 

@@ -1,8 +1,8 @@
 # slidegen
 
-A **local-first AI slide generator**. Claude Code plans the deck, Nano Banana renders the imagery, real PowerPoint text gets overlaid by the renderer, and you walk away with a `.pptx` (or `.pdf`) you can drop into Google Slides, Keynote, or PowerPoint.
+A **local-first AI slide generator**. Claude Code (or DeepSeek) plans the deck, Nano Banana renders the imagery, real PowerPoint text gets overlaid by the renderer, and you walk away with a `.pptx` (or `.pdf`) you can drop into Google Slides, Keynote, or PowerPoint.
 
-Runs entirely on your machine. Your `claude` CLI subscription handles the planning; you bring a Google API key for image generation. No server to deploy, no data leaves your laptop except the API calls.
+Runs entirely on your machine. The planning/refining/review text work is handled by your choice of model — the local `claude` CLI (uses your CC subscription) or the DeepSeek API (pay-per-token). You bring a Google API key for image generation. No server to deploy, no data leaves your laptop except the API calls.
 
 ## What it does
 
@@ -31,7 +31,9 @@ You also need:
 
 - **Node 20+** (Next.js 16 minimum)
 - **pnpm**
-- **Claude Code CLI** authed on your machine — `which claude` should resolve. The app shells out to your local `claude` binary, which uses your existing CC subscription. No `ANTHROPIC_API_KEY` is read by the app.
+- **A planning model** — either:
+  - **Claude Code CLI** (default) authed on your machine — `which claude` should resolve. The app shells out to your local `claude` binary, which uses your existing CC subscription. No `ANTHROPIC_API_KEY` is read by the app.
+  - **DeepSeek** — add a `DEEPSEEK_API_KEY` to `.env.local`, then pick DeepSeek in the planner UI (or set `SLIDEGEN_PROVIDER=deepseek`). No Claude Code / Anthropic account required. See [Providers](#providers-claude-or-deepseek) below.
 
 ## Run
 
@@ -41,11 +43,34 @@ pnpm dev
 
 Open <http://localhost:3000>. Pick a template + theme, write a topic, click **Plan deck**, then **Generate all**. Export with `.pptx` or `.pdf`.
 
+## Providers: Claude or DeepSeek
+
+The text side of slidegen (planning, refining, whole-deck review) is provider-agnostic. Pick the model in the planner UI, or force a default with `SLIDEGEN_PROVIDER`.
+
+| | Claude (default) | DeepSeek |
+|---|---|---|
+| Backend | Your local Claude Code CLI | DeepSeek API (OpenAI-compatible) |
+| Auth | CC subscription — no key needed | `DEEPSEEK_API_KEY` in `.env.local` |
+| Per-slide image auto-review | ✅ Claude Code (vision) | ✅ Gemini (vision) — DeepSeek is text-only |
+| Typical text cost | $0 metered (subscription) | Pay-per-token (cents per deck) |
+
+DeepSeek env vars (all optional except the API key):
+
+- `DEEPSEEK_API_KEY` — required to use DeepSeek
+- `DEEPSEEK_MODEL` — default `deepseek-chat`; try `deepseek-reasoner` for deeper reasoning
+- `DEEPSEEK_BASE_URL` — default `https://api.deepseek.com`
+- `DEEPSEEK_INPUT_USD_PER_MTOKEN` / `DEEPSEEK_OUTPUT_USD_PER_MTOKEN` — token price overrides used for the cost estimate
+
+> **Note:** DeepSeek's chat models are text-only, so the per-slide **auto-review** (which reads a screenshot of the composed slide) is automatically handled by **Gemini** — the same Google key you already use for image generation. That means **you can drop Claude entirely**: DeepSeek does planning/refining/deck review, Gemini does images + slide review.
+
 ## Cost model
 
 | Operation | Where it bills | Typical cost |
 |---|---|---|
-| Plan / Refine / Review (Claude) | Your Claude Code subscription seat | Covered by plan, $0 metered |
+| Plan / Refine / Deck review (Claude) | Your Claude Code subscription seat | Covered by plan, $0 metered |
+| Plan / Refine / Deck review (DeepSeek) | Your DeepSeek API key | Cents per deck (pay per token) |
+| Slide image auto-review (Claude) | Claude Code (vision) | Covered by plan, $0 metered |
+| Slide image auto-review (DeepSeek) | Your Google API key (Gemini) | ~$0.001–0.002 per review |
 | Image generation (Nano Banana) | Your Google API key | **~$0.039 per image** (1290 output tokens × $30/1M) |
 | Text-only slides (comparison, agenda, charts) | — | $0 |
 | `.pptx` / `.pdf` export | — | $0 (local) |
@@ -86,7 +111,7 @@ A typical 10-slide deck has 5–6 imaged slides → **~$0.20–$0.25 per deck**.
  └──────────────────────┘
 ```
 
-The Claude server is modeled on `gstack browse`'s pattern: persistent loopback HTTP service, token in `.slidegen/claude-server.json`, auto-respawn on first request, idle-shuts-down at 30 min.
+The LLM server is modeled on `gstack browse`'s pattern: persistent loopback HTTP service, token in `.slidegen/claude-server.json`, auto-respawn on first request, idle-shuts-down at 30 min. By default it spawns your local `claude` CLI per request; when a request asks for the DeepSeek provider it calls the DeepSeek API directly instead.
 
 ## Project layout
 

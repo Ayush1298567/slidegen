@@ -1,5 +1,5 @@
 import { startRefine, streamEvents } from '@/lib/claude-client';
-import type { Deck } from '@/lib/types';
+import { toLlmProvider, type Deck, type LlmProvider } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -11,10 +11,12 @@ function ndjson(obj: unknown): Uint8Array {
 export async function POST(req: Request) {
   let deck: Deck | undefined;
   let instruction = '';
+  let provider: LlmProvider = 'claude';
   try {
     const body = await req.json();
     deck = body?.deck as Deck | undefined;
     instruction = String(body?.instruction ?? '').trim();
+    provider = toLlmProvider(body?.provider);
   } catch {
     return Response.json({ error: 'invalid body' }, { status: 400 });
   }
@@ -30,8 +32,8 @@ export async function POST(req: Request) {
         try { controller.enqueue(ndjson(obj)); } catch { /* closed */ }
       };
       try {
-        send({ type: 'status', text: 'Spawning Claude…' });
-        const { sessionId } = await startRefine({ deck: safeDeck, instruction: safeInstruction });
+        send({ type: 'status', text: `Spawning ${provider === 'deepseek' ? 'DeepSeek' : 'Claude'}…` });
+        const { sessionId } = await startRefine({ deck: safeDeck, instruction: safeInstruction, provider });
         let finalResult: unknown = null;
         let finalError: string | null = null;
         await streamEvents(sessionId, (evt) => {
